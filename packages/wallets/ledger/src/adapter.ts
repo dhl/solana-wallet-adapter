@@ -1,8 +1,10 @@
+import type Solana from '@ledgerhq/hw-app-solana';
 import type { default as Transport } from '@ledgerhq/hw-transport';
 import type { default as TransportWebHID } from '@ledgerhq/hw-transport-webhid';
 import type { WalletName } from '@solana/wallet-adapter-base';
+import { isVersionedTransaction } from '@solana/wallet-adapter-base';
 import {
-    BaseSignerWalletAdapter,
+    BaseMessageSignerWalletAdapter,
     WalletConnectionError,
     WalletDisconnectedError,
     WalletDisconnectionError,
@@ -13,9 +15,10 @@ import {
     WalletReadyState,
     WalletSignTransactionError,
 } from '@solana/wallet-adapter-base';
-import type { PublicKey, Transaction, TransactionVersion, VersionedTransaction } from '@solana/web3.js';
+import type { Transaction, TransactionVersion, VersionedTransaction } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import './polyfills/index.js';
-import { getDerivationPath, getPublicKey, signTransaction } from './util.js';
+import { toDerivationPath } from './util.js';
 
 export interface LedgerWalletAdapterConfig {
     derivationPath?: Buffer;
@@ -23,15 +26,16 @@ export interface LedgerWalletAdapterConfig {
 
 export const LedgerWalletName = 'Ledger' as WalletName<'Ledger'>;
 
-export class LedgerWalletAdapter extends BaseSignerWalletAdapter {
+export class LedgerWalletAdapter extends BaseMessageSignerWalletAdapter {
     name = LedgerWalletName;
     url = 'https://ledger.com';
     icon =
         'data:image/svg+xml;base64,PHN2ZyB2aWV3Qm94PSIwIDAgMzUgMzUiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PGcgZmlsbD0iI2ZmZiI+PHBhdGggZD0ibTIzLjU4OCAwaC0xNnYyMS41ODNoMjEuNnYtMTZhNS41ODUgNS41ODUgMCAwIDAgLTUuNi01LjU4M3oiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDUuNzM5KSIvPjxwYXRoIGQ9Im04LjM0MiAwaC0yLjc1N2E1LjU4NSA1LjU4NSAwIDAgMCAtNS41ODUgNS41ODV2Mi43NTdoOC4zNDJ6Ii8+PHBhdGggZD0ibTAgNy41OWg4LjM0MnY4LjM0MmgtOC4zNDJ6IiB0cmFuc2Zvcm09InRyYW5zbGF0ZSgwIDUuNzM5KSIvPjxwYXRoIGQ9Im0xNS4xOCAyMy40NTFoMi43NTdhNS41ODUgNS41ODUgMCAwIDAgNS41ODUtNS42di0yLjY3MWgtOC4zNDJ6IiB0cmFuc2Zvcm09InRyYW5zbGF0ZSgxMS40NzggMTEuNDc4KSIvPjxwYXRoIGQ9Im03LjU5IDE1LjE4aDguMzQydjguMzQyaC04LjM0MnoiIHRyYW5zZm9ybT0idHJhbnNsYXRlKDUuNzM5IDExLjQ3OCkiLz48cGF0aCBkPSJtMCAxNS4xOHYyLjc1N2E1LjU4NSA1LjU4NSAwIDAgMCA1LjU4NSA1LjU4NWgyLjc1N3YtOC4zNDJ6IiB0cmFuc2Zvcm09InRyYW5zbGF0ZSgwIDExLjQ3OCkiLz48L2c+PC9zdmc+';
     supportedTransactionVersions: ReadonlySet<TransactionVersion> = new Set(['legacy', 0]);
 
-    private _derivationPath: Buffer;
+    private _derivationPath: string;
     private _connecting: boolean;
+    private _ledgerApp: Solana | null;
     private _transport: Transport | null;
     private _publicKey: PublicKey | null;
     private _readyState: WalletReadyState =
@@ -44,8 +48,10 @@ export class LedgerWalletAdapter extends BaseSignerWalletAdapter {
 
     constructor(config: LedgerWalletAdapterConfig = {}) {
         super();
-        this._derivationPath = config.derivationPath || getDerivationPath(0, 0);
+
+        this._derivationPath = config.derivationPath ? toDerivationPath(config.derivationPath) : `44'/501'/0'/0'`;
         this._connecting = false;
+        this._ledgerApp = null;
         this._transport = null;
         this._publicKey = null;
     }
@@ -77,15 +83,18 @@ export class LedgerWalletAdapter extends BaseSignerWalletAdapter {
             }
 
             let transport: Transport;
+            let ledgerApp: Solana;
             try {
                 transport = await TransportWebHIDClass.create();
+                const SolanaApp = (await import('@ledgerhq/hw-app-solana')).default;
+                ledgerApp = new SolanaApp(transport);
             } catch (error: any) {
                 throw new WalletConnectionError(error?.message, error);
             }
 
             let publicKey: PublicKey;
             try {
-                publicKey = await getPublicKey(transport, this._derivationPath);
+                publicKey = new PublicKey(await ledgerApp.getAddress(this._derivationPath));
             } catch (error: any) {
                 throw new WalletPublicKeyError(error?.message, error);
             }
@@ -94,6 +103,7 @@ export class LedgerWalletAdapter extends BaseSignerWalletAdapter {
 
             this._transport = transport;
             this._publicKey = publicKey;
+            this._ledgerApp = ledgerApp;
 
             this.emit('connect', publicKey);
         } catch (error: any) {
@@ -111,6 +121,7 @@ export class LedgerWalletAdapter extends BaseSignerWalletAdapter {
 
             this._transport = null;
             this._publicKey = null;
+            this._ledgerApp = null;
 
             try {
                 await transport.close();
@@ -126,16 +137,42 @@ export class LedgerWalletAdapter extends BaseSignerWalletAdapter {
         try {
             const transport = this._transport;
             const publicKey = this._publicKey;
-            if (!transport || !publicKey) throw new WalletNotConnectedError();
+            const ledgerApp = this._ledgerApp;
+            if (!transport || !publicKey || !ledgerApp) throw new WalletNotConnectedError();
 
             try {
-                const signature = await signTransaction(transport, transaction, this._derivationPath);
+                const serializedTransaction = isVersionedTransaction(transaction)
+                    ? Buffer.from(transaction.message.serialize())
+                    : transaction.serializeMessage();
+
+                const { signature } = await ledgerApp.signTransaction(this._derivationPath, serializedTransaction);
+
                 transaction.addSignature(publicKey, signature);
             } catch (error: any) {
                 throw new WalletSignTransactionError(error?.message, error);
             }
 
             return transaction;
+        } catch (error: any) {
+            this.emit('error', error);
+            throw error;
+        }
+    }
+
+    async signMessage(message: Uint8Array): Promise<Uint8Array> {
+        try {
+            const transport = this._transport;
+            const publicKey = this._publicKey;
+            const ledgerApp = this._ledgerApp;
+            if (!transport || !publicKey || !ledgerApp) throw new WalletNotConnectedError();
+
+            try {
+                const msgBuffer = Buffer.from(message);
+                const { signature } = await ledgerApp.signOffchainMessage(this._derivationPath, msgBuffer);
+                return signature;
+            } catch (error: any) {
+                throw new WalletSignTransactionError(error?.message, error);
+            }
         } catch (error: any) {
             this.emit('error', error);
             throw error;

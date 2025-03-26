@@ -1,8 +1,3 @@
-import type { default as Transport } from '@ledgerhq/hw-transport';
-import { StatusCodes, TransportStatusError } from '@ledgerhq/hw-transport';
-import { isVersionedTransaction } from '@solana/wallet-adapter-base';
-import type { Transaction, VersionedTransaction } from '@solana/web3.js';
-import { PublicKey } from '@solana/web3.js';
 import './polyfills/index.js';
 
 export function getDerivationPath(account?: number, change?: number): Buffer {
@@ -29,60 +24,35 @@ function harden(n: number): number {
     return (n | BIP32_HARDENED_BIT) >>> 0;
 }
 
-const INS_GET_PUBKEY = 0x05;
-const INS_SIGN_MESSAGE = 0x06;
+/**
+ * Format a Buffer encoded BIP32 derivation path to its string representation
+ *
+ * @see {@link https://github.com/LedgerHQ/ledger-live/blob/706fe9dbb5022346d8e276d17c068937a80ad4d2/libs/ledgerjs/packages/hw-app-solana/src/Solana.ts Ledger Hardware Wallet Solana JavaScript bindings.}
+ *
+ * @param buffer The buffer containing the derivation path
+ * @returns The parsed derivation path as a string, e.g. "m/44'/501'/0'/0'"
+ */
+export function toDerivationPath(buffer: Buffer): string {
+    // First byte contains the length of path components
+    const length = buffer.readUInt8(0);
 
-const P1_NON_CONFIRM = 0x00;
-const P1_CONFIRM = 0x01;
+    // We always have 44' and 501' as the first two components
+    // Skip them and read account and change if available
+    const path = ["44'", "501'"];
 
-const P2_EXTEND = 0x01;
-const P2_MORE = 0x02;
-
-const MAX_PAYLOAD = 255;
-
-const LEDGER_CLA = 0xe0;
-
-/** @internal */
-export async function getPublicKey(transport: Transport, derivationPath: Buffer): Promise<PublicKey> {
-    const bytes = await send(transport, INS_GET_PUBKEY, P1_NON_CONFIRM, derivationPath);
-    return new PublicKey(bytes);
-}
-
-/** @internal */
-export async function signTransaction(
-    transport: Transport,
-    transaction: Transaction | VersionedTransaction,
-    derivationPath: Buffer
-): Promise<Buffer> {
-    const paths = Buffer.alloc(1);
-    paths.writeUInt8(1, 0);
-
-    const message = isVersionedTransaction(transaction)
-        ? transaction.message.serialize()
-        : transaction.serializeMessage();
-    const data = Buffer.concat([paths, derivationPath, message]);
-
-    return await send(transport, INS_SIGN_MESSAGE, P1_CONFIRM, data);
-}
-
-async function send(transport: Transport, instruction: number, p1: number, data: Buffer): Promise<Buffer> {
-    let p2 = 0;
-    let offset = 0;
-
-    if (data.length > MAX_PAYLOAD) {
-        while (data.length - offset > MAX_PAYLOAD) {
-            const buffer = data.slice(offset, offset + MAX_PAYLOAD);
-            const response = await transport.send(LEDGER_CLA, instruction, p1, p2 | P2_MORE, buffer);
-            // @ts-ignore -- TransportStatusError is a constructor Function, not a Class
-            if (response.length !== 2) throw new TransportStatusError(StatusCodes.INCORRECT_DATA);
-
-            p2 |= P2_EXTEND;
-            offset += MAX_PAYLOAD;
-        }
+    // If length is at least 3, we have an account component
+    if (length >= 3) {
+        const accountWithHardening = buffer.readUInt32BE(9); // 1 byte + 2*4 bytes offset
+        const account = accountWithHardening & ~BIP32_HARDENED_BIT; // Remove hardening bit
+        path.push(`${account}'`);
     }
 
-    const buffer = data.slice(offset);
-    const response = await transport.send(LEDGER_CLA, instruction, p1, p2, buffer);
+    // If length is at least 4, we have a change component
+    if (length >= 4) {
+        const changeWithHardening = buffer.readUInt32BE(13); // 1 byte + 3*4 bytes offset
+        const change = changeWithHardening & ~BIP32_HARDENED_BIT; // Remove hardening bit
+        path.push(`${change}'`);
+    }
 
-    return response.slice(0, response.length - 2);
+    return path.join('/');
 }
